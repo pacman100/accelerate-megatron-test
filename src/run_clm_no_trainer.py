@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, MegatronLMDummyScheduler
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -488,20 +488,33 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        lr_scheduler = MegatronLMDummyScheduler(
+            optimizer=optimizer,
+            total_num_steps=args.max_train_steps * args.gradient_accumulation_steps,
+            warmup_num_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
 
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
+    accelerator.print(model)
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        num_update_steps_per_epoch = (
+            num_update_steps_per_epoch // train_dataloader.batch_sampler.micro_batch_times_data_parallel_size
+        )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -566,6 +579,7 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     for epoch in range(starting_epoch, args.num_train_epochs):
+        accelerator.print(f"Epoch {epoch + 1}/{args.num_train_epochs}")
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -611,7 +625,7 @@ def main():
 
             loss = outputs.loss
             if accelerator.process_index == accelerator.num_processes - 1:
-                losses.append(loss)
+                losses.append(loss.detach().float().item())
         #     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         # losses = torch.cat(losses)
@@ -622,24 +636,26 @@ def main():
         #     perplexity = float("inf")
         if accelerator.process_index == accelerator.num_processes - 1:
             try:
-                eval_loss = torch.mean(losses)
+                eval_loss = torch.mean(torch.tensor(losses, dtype=torch.float))
                 perplexity = math.exp(eval_loss)
             except OverflowError:
                 perplexity = float("inf")
 
             logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
 
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    "perplexity": perplexity,
-                    "eval_loss": eval_loss,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
+            if args.with_tracking:
+                accelerator.log(
+                    {
+                        "perplexity": perplexity,
+                        "eval_loss": eval_loss,
+                        "train_loss": total_loss.item()
+                        / len(train_dataloader)
+                        * train_dataloader.batch_sampler.micro_batch_times_data_parallel_size,
+                        "epoch": epoch,
+                        "step": completed_steps,
+                    },
+                    step=completed_steps,
+                )
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
