@@ -41,6 +41,7 @@ import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, MegatronLMDummyScheduler
+from accelerate.tracking import LOGGER_TYPE_TO_CLASS
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -251,11 +252,7 @@ def main():
     # in the environment
     accelerator_log_kwargs = {}
 
-    if args.with_tracking:
-        accelerator_log_kwargs["log_with"] = args.report_to
-        accelerator_log_kwargs["logging_dir"] = args.output_dir
-
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -534,7 +531,12 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("clm_no_trainer", experiment_config)
+        tracker = None
+        if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+            if accelerator.is_last_rank:
+                tracker = LOGGER_TYPE_TO_CLASS[args.report_to]("clm_no_trainer")
+        if tracker:
+            tracker.store_init_configuration(experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -626,14 +628,6 @@ def main():
             loss = outputs.loss
             if accelerator.process_index == accelerator.num_processes - 1:
                 losses.append(loss.detach().float().item())
-        #     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-
-        # losses = torch.cat(losses)
-        # try:
-        #     eval_loss = torch.mean(losses)
-        #     perplexity = math.exp(eval_loss)
-        # except OverflowError:
-        #     perplexity = float("inf")
         if accelerator.process_index == accelerator.num_processes - 1:
             try:
                 eval_loss = torch.mean(torch.tensor(losses, dtype=torch.float))
@@ -644,50 +638,21 @@ def main():
             logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
 
             if args.with_tracking:
-                accelerator.log(
-                    {
-                        "perplexity": perplexity,
-                        "eval_loss": eval_loss,
-                        "train_loss": total_loss.item()
-                        / len(train_dataloader)
-                        * train_dataloader.batch_sampler.micro_batch_times_data_parallel_size,
-                        "epoch": epoch,
-                        "step": completed_steps,
-                    },
-                    step=completed_steps,
-                )
+                if tracker:
+                    tracker.log(
+                        {
+                            "perplexity": perplexity,
+                            "eval_loss": eval_loss,
+                            "train_loss": total_loss.item()
+                            / len(train_dataloader)
+                            * train_dataloader.batch_sampler.micro_batch_times_data_parallel_size,
+                            "epoch": epoch,
+                            "step": completed_steps,
+                        },
+                        step=completed_steps,
+                    )
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
-
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump({"perplexity": perplexity}, f)
+        accelerator.save_state(args.output_dir)
 
 
 if __name__ == "__main__":
