@@ -41,7 +41,6 @@ import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, MegatronLMDummyScheduler
-from accelerate.tracking import LOGGER_TYPE_TO_CLASS
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -252,7 +251,11 @@ def main():
     # in the environment
     accelerator_log_kwargs = {}
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    if args.with_tracking:
+        accelerator_log_kwargs["log_with"] = args.report_to
+        accelerator_log_kwargs["logging_dir"] = args.output_dir
+
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -474,10 +477,6 @@ def main():
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
-    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
-
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -504,26 +503,21 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    accelerator.print(model)
+    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
+    if accelerator.distributed_type == DistributedType.TPU:
+        model.tie_weights()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
-        num_update_steps_per_epoch = (
-            num_update_steps_per_epoch // train_dataloader.batch_sampler.micro_batch_times_data_parallel_size
-        )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # Figure out how many steps we should save the Accelerator states
-    if hasattr(args.checkpointing_steps, "isdigit"):
-        checkpointing_steps = args.checkpointing_steps
-        if args.checkpointing_steps.isdigit():
-            checkpointing_steps = int(args.checkpointing_steps)
-    else:
-        checkpointing_steps = None
+    checkpointing_steps = args.checkpointing_steps
+    if checkpointing_steps is not None and checkpointing_steps.isdigit():
+        checkpointing_steps = int(checkpointing_steps)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -531,12 +525,7 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        tracker = None
-        if accelerator.distributed_type == DistributedType.MEGATRON_LM:
-            if accelerator.is_last_rank:
-                tracker = LOGGER_TYPE_TO_CLASS[args.report_to]("clm_no_trainer")
-        if tracker:
-            tracker.store_init_configuration(experiment_config)
+        accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -581,7 +570,6 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        accelerator.print(f"Epoch {epoch + 1}/{args.num_train_epochs}")
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -626,33 +614,52 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-            if accelerator.process_index == accelerator.num_processes - 1:
-                losses.append(loss.detach().float().item())
-        if accelerator.process_index == accelerator.num_processes - 1:
-            try:
-                eval_loss = torch.mean(torch.tensor(losses, dtype=torch.float))
-                perplexity = math.exp(eval_loss)
-            except OverflowError:
-                perplexity = float("inf")
+            losses.append(loss.detach().float().item())
 
-            logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+        try:
+            eval_loss = torch.mean(torch.tensor(losses, dtype=torch.float))
+            perplexity = math.exp(eval_loss)
+        except OverflowError:
+            perplexity = float("inf")
 
-            if args.with_tracking:
-                if tracker:
-                    tracker.log(
-                        {
-                            "perplexity": perplexity,
-                            "eval_loss": eval_loss,
-                            "train_loss": total_loss.item()
-                            / len(train_dataloader)
-                            * train_dataloader.batch_sampler.micro_batch_times_data_parallel_size,
-                            "epoch": epoch,
-                            "step": completed_steps,
-                        },
-                        step=completed_steps,
-                    )
+        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
 
-        accelerator.save_state(args.output_dir)
+        if args.with_tracking:
+            accelerator.log(
+                {
+                    "perplexity": perplexity,
+                    "eval_loss": eval_loss,
+                    "train_loss": total_loss.item() / len(train_dataloader),
+                    "epoch": epoch,
+                    "step": completed_steps,
+                },
+                step=completed_steps,
+            )
+
+        if args.push_to_hub and epoch < args.num_train_epochs - 1:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(
+                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(args.output_dir)
+                repo.push_to_hub(
+                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+                )
+
+        if args.checkpointing_steps == "epoch":
+            output_dir = f"epoch_{epoch}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+
+    #     if args.with_tracking:
+    #         accelerator.end_training()
+
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+            json.dump({"perplexity": perplexity}, f)
 
 
 if __name__ == "__main__":
