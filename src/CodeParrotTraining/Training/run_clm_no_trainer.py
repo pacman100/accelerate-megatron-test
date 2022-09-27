@@ -221,7 +221,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "config_overrides",
+        "--config_overrides",
         type=str,
         default=None,
         help="Override some existing default config settings when a model is trained from scratch. Example: "
