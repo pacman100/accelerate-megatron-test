@@ -349,8 +349,7 @@ def main():
         if len(ids) == 1:
             keytoken_ids.append(ids[0])
     accelerator.print(f"Keytoken ids: {keytoken_ids}")
-    custom_train_step_class = GPTTrainStepWithCustomLoss()
-    accelerator.state.megatron_lm_plugin.custom_train_step_class = custom_train_step_class
+    accelerator.state.megatron_lm_plugin.custom_train_step_class = GPTTrainStepWithCustomLoss
     accelerator.state.megatron_lm_plugin.custom_train_step_kwargs = {
         "keytoken_ids": keytoken_ids,
         "alpha": 1.0,
