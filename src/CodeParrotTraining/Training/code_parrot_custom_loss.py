@@ -23,6 +23,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import argparse
+from functools import partial
 import json
 import logging
 import math
@@ -40,7 +41,14 @@ from tqdm.auto import tqdm
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, MegatronLMDummyScheduler
+from accelerate.utils import (
+    set_seed,
+    MegatronLMDummyScheduler,
+    GPTTrainStep,
+    avg_losses_across_data_parallel_group,
+    MegatronLMDummyDataLoader,
+    MegatronLMPlugin,
+)
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -70,27 +78,22 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
     parser.add_argument(
-        "--dataset_name",
+        "--data_path",
         type=str,
         default=None,
-        help="The name of the dataset to use (via the datasets library).",
+        help="Path to the training dataset. Accepted format:"
+        "1) a single data path, 2) multiple datasets in the"
+        "form: dataset1-weight dataset1-path dataset2-weight "
+        "dataset2-path ...",
     )
+    parser.add_argument("--data_impl", type=str, default="mmap", help="Method used to load the data.")
     parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The configuration name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
-    )
-    parser.add_argument(
-        "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
-    )
-    parser.add_argument(
-        "--validation_split_percentage",
-        default=5,
-        help="The percentage of the train set used as validation set in case there's no validation split",
+        "--splits_string",
+        default="949,50,1",
+        help="Comma-separated list of proportions for training,"
+        " validation, and test split. For example the split "
+        "`90,5,5` will use 90%% of data for training, 5%% for "
+        "validation and 5%% for test.",
     )
     parser.add_argument(
         "--model_name_or_path",
@@ -220,23 +223,56 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
+    parser.add_argument(
+        "--config_overrides",
+        type=str,
+        default=None,
+        help="Override some existing default config settings when a model is trained from scratch. Example: "
+        "n_embd=10,resid_pdrop=0.2,scale_attn_weights=false,summary_type=cls_index",
+    )
     args = parser.parse_args()
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_file is None and args.validation_file is None:
-        raise ValueError("Need either a dataset name or a training/validation file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, json or txt file."
-        if args.validation_file is not None:
-            extension = args.validation_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, json or txt file."
-
-    if args.push_to_hub:
-        assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
-
     return args
+
+
+class GPTTrainStepWithCustomLoss(GPTTrainStep):
+    def __init__(self, megatron_args, **kwargs):
+        super().__init__(megatron_args)
+        self.kwargs = kwargs
+
+    def get_loss_func(self):
+        def loss_func(inputs, loss_mask, output_tensor):
+            batch_size, seq_length = output_tensor.shape
+            losses = output_tensor.float()
+            loss_mask = loss_mask.view(-1).float()
+            loss = losses.view(-1) * loss_mask
+
+            # Resize and average loss per sample
+            loss_per_sample = loss.view(batch_size, seq_length).mean(axis=1)
+
+            # Calculate and scale weighting
+            weights = torch.stack([(inputs == kt).float() for kt in self.kwargs["keytoken_ids"]]).sum(axis=[0, 2])
+            weights = self.kwargs["alpha"] * (1.0 + weights)
+            # Calculate weighted average
+            weighted_loss = (loss_per_sample * weights).mean()
+            final_loss = torch.sum(weighted_loss) / loss_mask.sum()
+
+            # Reduce loss across data parallel groups
+            averaged_loss = avg_losses_across_data_parallel_group([final_loss])
+
+            return final_loss, {"lm loss": averaged_loss[0]}
+
+        return loss_func
+
+    def get_forward_step_func(self):
+        def forward_step(data_iterator, model):
+            """Forward step."""
+            # Get the batch.
+            tokens, labels, loss_mask, attention_mask, position_ids = self.get_batch(data_iterator)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+
+            return output_tensor, partial(self.loss_func, tokens, loss_mask)
+
+        return forward_step
 
 
 def main():
@@ -275,74 +311,6 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-    accelerator.wait_for_everyone()
-
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        extension = args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-            dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
-        raw_datasets = load_dataset(extension, data_files=data_files, **dataset_args)
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{args.validation_split_percentage}%]",
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{args.validation_split_percentage}%:]",
-                **dataset_args,
-            )
-
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -358,8 +326,15 @@ def main():
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
+    if args.config_overrides is not None:
+        logger.info(f"Overriding config: {args.config_overrides}")
+        config.update_from_string(args.config_overrides)
+        logger.info(f"New config: {config}")
+
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name, use_fast=not args.use_slow_tokenizer, use_auth_token=True
+        )
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
@@ -367,6 +342,19 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    keytoken_ids = []
+    keywords = ["plt", "pd", "sk", "fit", "predict", " plt", " pd", " sk", " fit", " predict"]
+    for keyword in keywords:
+        ids = tokenizer([keyword]).input_ids[0]
+        if len(ids) == 1:
+            keytoken_ids.append(ids[0])
+    accelerator.print(f"Keytoken ids: {keytoken_ids}")
+    custom_train_step_class = GPTTrainStepWithCustomLoss()
+    accelerator.state.megatron_lm_plugin.custom_train_step_class = custom_train_step_class
+    accelerator.state.megatron_lm_plugin.custom_train_step_kwargs = {
+        "keytoken_ids": keytoken_ids,
+        "alpha": 1.0,
+    }
 
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
@@ -379,88 +367,6 @@ def main():
         model = AutoModelForCausalLM.from_config(config)
 
     model.resize_token_embeddings(len(tokenizer))
-
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    column_names = raw_datasets["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
-
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
-
-    with accelerator.main_process_first():
-        tokenized_datasets = raw_datasets.map(
-            tokenize_function,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not args.overwrite_cache,
-            desc="Running tokenizer on dataset",
-        )
-
-    if args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > 1024:
-            logger.warning(
-                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                "Picking 1024 instead. You can change that default value by passing --block_size xxx."
-            )
-        block_size = 1024
-    else:
-        if args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(args.block_size, tokenizer.model_max_length)
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
-    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
-    # to preprocess.
-    #
-    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-
-    with accelerator.main_process_first():
-        lm_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {block_size}",
-        )
-
-    train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
-
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
-    # DataLoaders creation:
-    train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
-    )
-    eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
-    )
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -498,14 +404,19 @@ def main():
             num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         )
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
+    megatron_dataloader_config = {
+        "data_path": args.data_path,
+        "splits_string": args.splits_string,
+        "seq_length": args.block_size,
+    }
+    megatron_dataloader = MegatronLMDummyDataLoader(megatron_dataloader_config)
 
-    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
+    # Prepare everything with our `accelerator`.
+    # Repeat `megatron_dataloader` is repeated 3 times to get training, validation and test dataloaders
+    # as per the `args.splits_string` proportions
+    model, optimizer, lr_scheduler, train_dataloader, eval_dataloader, _ = accelerator.prepare(
+        model, optimizer, lr_scheduler, megatron_dataloader, megatron_dataloader, megatron_dataloader
+    )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -528,10 +439,14 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        total_batch_size = accelerator.state.megatron_lm_plugin.global_batch_size
+    else:
+        total_batch_size = (
+            args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        )
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -636,18 +551,6 @@ def main():
                 step=completed_steps,
             )
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
-
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
@@ -660,6 +563,7 @@ def main():
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
+    accelerator.save_state(output_dir)
 
 
 if __name__ == "__main__":

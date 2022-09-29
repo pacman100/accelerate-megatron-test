@@ -542,8 +542,12 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        total_batch_size = accelerator.state.megatron_lm_plugin.global_batch_size
+    else:
+        total_batch_size = (
+            args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        )
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
