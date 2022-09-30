@@ -23,6 +23,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import argparse
+from functools import partial
 import json
 import logging
 import math
@@ -40,7 +41,7 @@ from tqdm.auto import tqdm
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, MegatronLMDummyScheduler
+from accelerate.utils import set_seed, MegatronLMDummyScheduler, GPTTrainStep, avg_losses_across_data_parallel_group
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -246,6 +247,48 @@ def parse_args():
     return args
 
 
+class GPTTrainStepWithCustomLoss(GPTTrainStep):
+    def __init__(self, megatron_args, **kwargs):
+        super().__init__(megatron_args)
+        self.kwargs = kwargs
+
+    def get_loss_func(self):
+        def loss_func(inputs, loss_mask, output_tensor):
+            batch_size, seq_length = output_tensor.shape
+            losses = output_tensor.float()
+            loss_mask = loss_mask.view(-1).float()
+            loss = losses.view(-1) * loss_mask
+
+            # Resize and average loss per sample
+            loss_per_sample = loss.view(batch_size, seq_length).sum(axis=1)
+            loss_mask_per_sample = loss_mask.view(batch_size, seq_length).sum(axis=1)
+            loss_per_sample = loss_per_sample / loss_mask_per_sample
+
+            # Calculate and scale weighting
+            weights = torch.stack([(inputs == kt).float() for kt in self.kwargs["keytoken_ids"]]).sum(axis=[0, 2])
+            weights = self.kwargs["alpha"] * (1.0 + weights)
+            # Calculate weighted average
+            weighted_loss = (loss_per_sample * weights).mean()
+
+            # Reduce loss across data parallel groups
+            averaged_loss = avg_losses_across_data_parallel_group([weighted_loss])
+
+            return weighted_loss, {"lm loss": averaged_loss[0]}
+
+        return loss_func
+
+    def get_forward_step_func(self):
+        def forward_step(data_iterator, model):
+            """Forward step."""
+            # Get the batch.
+            tokens, labels, loss_mask, attention_mask, position_ids = self.get_batch(data_iterator)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+
+            return output_tensor, partial(self.loss_func, tokens, loss_mask)
+
+        return forward_step
+
+
 def main():
     args = parse_args()
 
@@ -381,6 +424,19 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
+    keytoken_ids = []
+    keywords = ["plt", "pd", "sk", "fit", "predict", " plt", " pd", " sk", " fit", " predict"]
+    for keyword in keywords:
+        ids = tokenizer([keyword]).input_ids[0]
+        if len(ids) == 1:
+            keytoken_ids.append(ids[0])
+    accelerator.print(f"Keytoken ids: {keytoken_ids}")
+    accelerator.state.megatron_lm_plugin.custom_train_step_class = GPTTrainStepWithCustomLoss
+    accelerator.state.megatron_lm_plugin.custom_train_step_kwargs = {
+        "keytoken_ids": keytoken_ids,
+        "alpha": 1.0,
+    }
 
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
