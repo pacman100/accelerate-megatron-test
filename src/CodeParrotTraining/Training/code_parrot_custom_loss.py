@@ -397,6 +397,7 @@ def main():
         "micro_batch_size": args.per_device_train_batch_size,
     }
     megatron_dataloader = MegatronLMDummyDataLoader(**megatron_dataloader_config)
+    accelerator.state.megatron_lm_plugin.megatron_dataset_flag = True
 
     # New Code
     # Prepare everything with our `accelerator`.
