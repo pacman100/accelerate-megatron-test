@@ -55,6 +55,7 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 from time import time
+from accelerate import init_empty_weights
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -403,17 +404,16 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    if args.model_name_or_path:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
+    logger.info("Training new model from scratch")
+    # New Code
+    # With Megatron-LM, no need of weights as the corresponding Megatron-Lm model is loaded
+    # with random weights. The Transformers model is dummy and is used only to get the
+    # corresponding config
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(config)
     else:
-        logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
-
-    model.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
