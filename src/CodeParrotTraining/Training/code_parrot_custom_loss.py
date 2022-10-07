@@ -351,15 +351,8 @@ def main():
         "alpha": 0.25,
     }
 
-    # New Code
-    # With Megatron-LM, no need of weights as the corresponding Megatron-Lm model is loaded
-    # with random weights. The Transformers model is dummy and is used only to get the
-    # corresponding config
-    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config)
-    else:
-        model = AutoModelForCausalLM.from_config(config)
+    logger.info("Training new model from scratch")
+    model = AutoModelForCausalLM.from_config(config)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
