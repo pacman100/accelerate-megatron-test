@@ -54,6 +54,7 @@ from transformers import (
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
+from time import time
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -227,6 +228,19 @@ def parse_args():
         help="Override some existing default config settings when a model is trained from scratch. Example: "
         "n_embd=10,resid_pdrop=0.2,scale_attn_weights=false,summary_type=cls_index",
     )
+    parser.add_argument(
+        "--n_train",
+        type=int,
+        default=2000,
+        help=("Number of training examples to use. If None, all training examples will be used."),
+    )
+    parser.add_argument(
+        "--n_val",
+        type=int,
+        default=500,
+        help=("Number of validation examples to use. If None, all validation examples will be used."),
+    )
+    parser.add_argument("--text_column_name", type=str, help=("name of the text column in the dataset"))
     args = parser.parse_args()
 
     # Sanity checks
@@ -300,6 +314,7 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    start_time = time()
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
     # (the dataset will be downloaded automatically from the datasets Hub).
@@ -323,6 +338,10 @@ def main():
                 args.dataset_config_name,
                 split=f"train[{args.validation_split_percentage}%:]",
             )
+        if args.n_train > 0:
+            raw_datasets["train"] = datasets.Dataset.from_dict(raw_datasets["train"][: args.n_train])
+        if args.n_val > 0:
+            raw_datasets["validation"] = datasets.Dataset.from_dict(raw_datasets["validation"][: args.n_val])
     else:
         data_files = {}
         dataset_args = {}
@@ -349,6 +368,8 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
                 **dataset_args,
             )
+    end_time = time()
+    accelerator.print(f"Dataset loaded in {(end_time - start_time)/60:.2f} minutes")
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -396,8 +417,9 @@ def main():
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
+    start_time = time()
     column_names = raw_datasets["train"].column_names
-    text_column_name = "content"
+    text_column_name = args.text_column_name if args.text_column_name in column_names else column_names[0]
 
     def tokenize_function(examples):
         return tokenizer(examples[text_column_name])
@@ -464,6 +486,9 @@ def main():
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
+    end_time = time()
+    accelerator.print(f"Dataset tokenized/preprocessed in {(end_time - start_time)/60:.2f} minutes")
+
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
@@ -498,6 +523,8 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
+    # New Code
+    # For Megatron-LM, we need to use `MegatronLMDummyScheduler` instead of regular schedulers
     if accelerator.distributed_type == DistributedType.MEGATRON_LM:
         lr_scheduler = MegatronLMDummyScheduler(
             optimizer=optimizer,
@@ -542,6 +569,9 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
+    # New Code
+    # For Megatron-LM, we need to get `global_batch_size` from megatron_lm_plugin
+    # as it handles the specifics related to data parallelism, tensor model parallelism and pipeline parallelism
     if accelerator.distributed_type == DistributedType.MEGATRON_LM:
         total_batch_size = accelerator.state.megatron_lm_plugin.global_batch_size
     else:
@@ -587,7 +617,9 @@ def main():
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
+    epoch_times = []
     for epoch in range(starting_epoch, args.num_train_epochs):
+        start_time = time()
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -632,10 +664,17 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-            losses.append(loss.detach().float().item())
 
+            # New Code
+            # For Megatron-LM, the losses are already averaged across the data parallel group
+            if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+                losses.append(loss)
+            else:
+                losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
         try:
-            eval_loss = torch.mean(torch.tensor(losses, dtype=torch.float))
+            if accelerator.distributed_type != DistributedType.MEGATRON_LM:
+                losses = torch.cat(losses)
+            eval_loss = torch.mean(losses)
             perplexity = math.exp(eval_loss)
         except OverflowError:
             perplexity = float("inf")
@@ -653,6 +692,10 @@ def main():
                 },
                 step=completed_steps,
             )
+
+        end_time = time()
+        epoch_times.append(end_time - start_time)
+        accelerator.print(f"epoch {epoch} training + evaluation took {epoch_times[-1]/60:2f} minutes")
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -672,9 +715,8 @@ def main():
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
 
-    #     if args.with_tracking:
-    #         accelerator.end_training()
-
+    total_training_time = sum(epoch_times)
+    accelerator.print(f"Total Training + Evaluation took {total_training_time/60:2f} minutes")
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)

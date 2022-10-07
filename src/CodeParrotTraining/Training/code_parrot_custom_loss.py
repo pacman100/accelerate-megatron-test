@@ -28,14 +28,9 @@ import json
 import logging
 import math
 import os
-import random
-from itertools import chain
-from pathlib import Path
 
 import datasets
 import torch
-from datasets import load_dataset
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 import transformers
@@ -48,19 +43,11 @@ from accelerate.utils import (
     avg_losses_across_data_parallel_group,
     MegatronLMDummyDataLoader,
 )
-from huggingface_hub import Repository
-from transformers import (
-    CONFIG_MAPPING,
-    MODEL_MAPPING,
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    SchedulerType,
-    default_data_collator,
-    get_scheduler,
-)
-from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
+
+from transformers import CONFIG_MAPPING, MODEL_MAPPING, AutoConfig, AutoModelForCausalLM, AutoTokenizer, SchedulerType
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+from time import time
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -76,6 +63,9 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
+
+    # New Code
+    # Arguments for the Megatron-LM indexed datasets
     parser.add_argument(
         "--data_path",
         nargs="*",
@@ -94,6 +84,7 @@ def parse_args():
         "`90,5,5` will use 90%% of data for training, 5%% for "
         "validation and 5%% for test.",
     )
+
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -233,6 +224,8 @@ def parse_args():
     return args
 
 
+# New Code
+# Custom loss function for the Megatron model
 class GPTTrainStepWithCustomLoss(GPTTrainStep):
     def __init__(self, megatron_args, **kwargs):
         super().__init__(megatron_args)
@@ -252,7 +245,7 @@ class GPTTrainStepWithCustomLoss(GPTTrainStep):
 
             # Calculate and scale weighting
             weights = torch.stack([(inputs == kt).float() for kt in self.kwargs["keytoken_ids"]]).sum(axis=[0, 2])
-            weights = self.kwargs["alpha"] * (1.0 + weights)
+            weights = 1.0 + self.kwargs["alpha"] * weights
             # Calculate weighted average
             weighted_loss = (loss_per_sample * weights).mean()
 
@@ -341,6 +334,9 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
+    # New Code
+    # Custom loss function for the Megatron model
     keytoken_ids = []
     keywords = ["plt", "pd", "sk", "fit", "predict", " plt", " pd", " sk", " fit", " predict"]
     for keyword in keywords:
@@ -351,8 +347,7 @@ def main():
     accelerator.state.megatron_lm_plugin.custom_train_step_class = GPTTrainStepWithCustomLoss
     accelerator.state.megatron_lm_plugin.custom_train_step_kwargs = {
         "keytoken_ids": keytoken_ids,
-        "alpha": 1.0,
-        "tokenizer": tokenizer,
+        "alpha": 0.25,
     }
 
     if args.model_name_or_path:
@@ -384,12 +379,18 @@ def main():
 
     # Scheduler and math around the number of training steps.
 
+    # New Code
+    # For Megatron-LM, we need to use `MegatronLMDummyScheduler` instead of regular schedulers
     lr_scheduler = MegatronLMDummyScheduler(
         optimizer=optimizer,
         total_num_steps=args.max_train_steps,
         warmup_num_steps=args.num_warmup_steps,
     )
 
+    # New Code
+    # For Megatron-LM indexed datasets, we need to use `MegatronLMDummyDataLoader`
+    # and pass the required dataset args to it such as `data_path`, `seq_length` etc.
+    # See `megatron.rguments._add_data_args` for the list of available args.
     megatron_dataloader_config = {
         "data_path": args.data_path,
         "splits_string": args.splits_string,
@@ -397,8 +398,8 @@ def main():
         "micro_batch_size": args.per_device_train_batch_size,
     }
     megatron_dataloader = MegatronLMDummyDataLoader(**megatron_dataloader_config)
-    accelerator.state.megatron_lm_plugin.megatron_dataset_flag = True
 
+    # New Code
     # Prepare everything with our `accelerator`.
     # Repeat `megatron_dataloader` is repeated 3 times to get training, validation and test dataloaders
     # as per the `args.splits_string` proportions
@@ -415,6 +416,9 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
+    # New Code
+    # For Megatron-LM, we need to get `global_batch_size` from megatron_lm_plugin
+    # as it handles the specifics related to data parallelism, tensor model parallelism and pipeline parallelism
     if accelerator.distributed_type == DistributedType.MEGATRON_LM:
         total_batch_size = accelerator.state.megatron_lm_plugin.global_batch_size
     else:
@@ -432,11 +436,18 @@ def main():
     eval_interval = accelerator.state.megatron_lm_plugin.eval_interval
     eval_iters = accelerator.state.megatron_lm_plugin.eval_iters
 
+    if args.with_tracking:
+        total_loss = 0
+
+    # New Code
+    # Custom changes here as train_dataloader is only available on tensor parallel ranks 0
+    # So, we need to iterate only if the dataloader isn't None else provide empty dict
+    # As such, we loop using `while` loop and break when `completed_steps` is equal to `args.max_train_steps`
+    # This is similar to the Megatron-LM setup wherein user has to provide
+    # `max_train_steps` when using Megaton-LM indexed datasets.
+    # This displays how flexible and extensible 🤗 Accelerate is.
     while completed_steps < args.max_train_steps:
         model.train()
-        if args.with_tracking:
-            total_loss = 0
-
         batch = next(train_dataloader) if train_dataloader is not None else {}
         outputs = model(**batch)
         loss = outputs.loss
@@ -449,8 +460,6 @@ def main():
         optimizer.zero_grad()
         progress_bar.update(1)
         completed_steps += 1
-        if completed_steps >= args.max_train_steps:
-            break
 
         if completed_steps % eval_interval == 0:
             eval_completed_steps = 0
@@ -483,11 +492,10 @@ def main():
                     },
                     step=completed_steps,
                 )
-
+    accelerator.save_state(args.output_dir)
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
-    accelerator.save_state(args.output_dir)
 
 
 if __name__ == "__main__":
