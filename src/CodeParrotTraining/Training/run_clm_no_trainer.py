@@ -495,10 +495,14 @@ def main():
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset,
+        shuffle=True,
+        collate_fn=default_data_collator,
+        batch_size=args.per_device_train_batch_size,
+        drop_last=True,
     )
     eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
+        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size, drop_last=True
     )
 
     # Optimizer
@@ -672,7 +676,9 @@ def main():
             else:
                 losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
         try:
-            if accelerator.distributed_type != DistributedType.MEGATRON_LM:
+            if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+                losses = torch.tensor(losses)
+            else:
                 losses = torch.cat(losses)
             eval_loss = torch.mean(losses)
             perplexity = math.exp(eval_loss)
