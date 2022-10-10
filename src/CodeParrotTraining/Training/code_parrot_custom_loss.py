@@ -351,8 +351,17 @@ def main():
         "alpha": 0.25,
     }
 
-    logger.info("Training new model from scratch")
-    model = AutoModelForCausalLM.from_config(config)
+    if args.model_name_or_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
+
+    model.resize_token_embeddings(len(tokenizer))
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -367,7 +376,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Scheduler and math around the number of training steps.
 

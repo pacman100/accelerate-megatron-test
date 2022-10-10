@@ -404,8 +404,17 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    logger.info("Training new model from scratch")
-    model = AutoModelForCausalLM.from_config(config)
+    if args.model_name_or_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
+
+    model.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -510,7 +519,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
