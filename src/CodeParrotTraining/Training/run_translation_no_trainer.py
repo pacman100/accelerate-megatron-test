@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2021 The HuggingFace Inc. team. All rights reserved.
+# Copyright The HuggingFace Team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...)
-on a text file or a dataset without using HuggingFace Trainer.
-
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
-https://huggingface.co/models?filter=text-generation
+Fine-tuning a 🤗 Transformers model on text translation.
 """
-# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+# You can also adapt this script on your own text translation task. Pointers for this are left as comments.
 
 import argparse
 import json
@@ -28,15 +24,16 @@ import logging
 import math
 import os
 import random
-from itertools import chain
 from pathlib import Path
 
 import datasets
+import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+import evaluate
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
@@ -46,35 +43,46 @@ from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
     AutoConfig,
-    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    MBartTokenizer,
+    MBartTokenizerFast,
     SchedulerType,
     default_data_collator,
     get_scheduler,
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
-from time import time
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.22.0.dev0")
+check_min_version("4.23.0.dev0")
 
 logger = get_logger(__name__)
+require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/translation/requirements.txt")
 
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
-
+# You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+# Parsing input arguments
 def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
+
+    parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
         "--dataset_name",
         type=str,
         default=None,
         help="The name of the dataset to use (via the datasets library).",
+    )
+
+    parser.add_argument(
+        "--predict_with_generate",
+        type=bool,
+        default=True,
+        help="",
     )
     parser.add_argument(
         "--dataset_config_name",
@@ -85,13 +93,91 @@ def parse_args():
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
     )
+
+    parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=None,
+        help=(
+            "Number of beams to use for evaluation. This argument will be "
+            "passed to ``model.generate``, which is used during ``evaluate`` and ``predict``."
+        ),
+    )
+
+    parser.add_argument(
+        "--max_source_length",
+        type=int,
+        default=1024,
+        help=(
+            "The maximum total input sequence length after "
+            "tokenization.Sequences longer than this will be truncated, sequences shorter will be padded."
+        ),
+    )
+    parser.add_argument(
+        "--max_target_length",
+        type=int,
+        default=128,
+        help=(
+            "The maximum total sequence length for target text after "
+            "tokenization. Sequences longer than this will be truncated, sequences shorter will be padded."
+            "during ``evaluate`` and ``predict``."
+        ),
+    )
+    parser.add_argument(
+        "--val_max_target_length",
+        type=int,
+        default=None,
+        help=(
+            "The maximum total sequence length for validation "
+            "target text after tokenization.Sequences longer than this will be truncated, sequences shorter will be "
+            "padded. Will default to `max_target_length`.This argument is also used to override the ``max_length`` "
+            "param of ``model.generate``, which is used during ``evaluate`` and ``predict``."
+        ),
+    )
+    parser.add_argument(
+        "--pad_to_max_length",
+        type=bool,
+        default=False,
+        help=(
+            "Whether to pad all samples to model maximum sentence "
+            "length. If False, will pad the samples dynamically when batching to the maximum length in the batch. More"
+            "efficient on GPU but very bad for TPU."
+        ),
+    )
     parser.add_argument(
         "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
     )
     parser.add_argument(
-        "--validation_split_percentage",
-        default=5,
-        help="The percentage of the train set used as validation set in case there's no validation split",
+        "--ignore_pad_token_for_loss",
+        type=bool,
+        default=True,
+        help="Whether to ignore the tokens corresponding to padded labels in the loss computation or not.",
+    )
+    parser.add_argument("--source_lang", type=str, default=None, help="Source language id for translation.")
+    parser.add_argument("--target_lang", type=str, default=None, help="Target language id for translation.")
+    parser.add_argument(
+        "--source_prefix",
+        type=str,
+        default=None,
+        help="A prefix to add before every source text (useful for T5 models).",
+    )
+    parser.add_argument(
+        "--preprocessing_num_workers",
+        type=int,
+        default=None,
+        help="The number of processes to use for the preprocessing.",
+    )
+    parser.add_argument(
+        "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=128,
+        help=(
+            "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
+            " sequences shorter will be padded if `--pad_to_max_lengh` is passed."
+        ),
     )
     parser.add_argument(
         "--model_name_or_path",
@@ -167,28 +253,6 @@ def parse_args():
         help="Model type to use if training from scratch.",
         choices=MODEL_TYPES,
     )
-    parser.add_argument(
-        "--block_size",
-        type=int,
-        default=None,
-        help=(
-            "Optional input sequence length after tokenization. The training dataset will be truncated in block of"
-            " this size for training. Default to the model max input length for single sentence inputs (take into"
-            " account special tokens)."
-        ),
-    )
-    parser.add_argument(
-        "--preprocessing_num_workers",
-        type=int,
-        default=None,
-        help="The number of processes to use for the preprocessing.",
-    )
-    parser.add_argument(
-        "--overwrite_cache", type=bool, default=False, help="Overwrite the cached training and evaluation sets"
-    )
-    parser.add_argument(
-        "--no_keep_linebreaks", action="store_true", help="Do not keep line breaks when using TXT files."
-    )
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
@@ -221,38 +285,19 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
-    parser.add_argument(
-        "--config_overrides",
-        type=str,
-        default=None,
-        help="Override some existing default config settings when a model is trained from scratch. Example: "
-        "n_embd=10,resid_pdrop=0.2,scale_attn_weights=false,summary_type=cls_index",
-    )
-    parser.add_argument(
-        "--n_train",
-        type=int,
-        default=2000,
-        help=("Number of training examples to use. If None, all training examples will be used."),
-    )
-    parser.add_argument(
-        "--n_val",
-        type=int,
-        default=500,
-        help=("Number of validation examples to use. If None, all validation examples will be used."),
-    )
-    parser.add_argument("--text_column_name", type=str, help=("name of the text column in the dataset"))
     args = parser.parse_args()
 
     # Sanity checks
+
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
-        raise ValueError("Need either a dataset name or a training/validation file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, json or txt file."
-        if args.validation_file is not None:
-            extension = args.validation_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, json or txt file."
+        raise ValueError("Need either a task name or a training/validation file.")
+
+    if args.train_file is not None:
+        extension = args.train_file.split(".")[-1]
+        assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+    if args.validation_file is not None:
+        extension = args.validation_file.split(".")[-1]
+        assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
 
     if args.push_to_hub:
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
@@ -261,22 +306,19 @@ def parse_args():
 
 
 def main():
+    # Parse the arguments
     args = parse_args()
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_clm_no_trainer", args)
+    send_example_telemetry("run_translation_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
-    accelerator_log_kwargs = {}
-
-    if args.with_tracking:
-        accelerator_log_kwargs["log_with"] = args.report_to
-        accelerator_log_kwargs["logging_dir"] = args.output_dir
-
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    accelerator = (
+        Accelerator(log_with=args.report_to, logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+    )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -314,7 +356,6 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    start_time = time()
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
     # (the dataset will be downloaded automatically from the datasets Hub).
@@ -327,50 +368,14 @@ def main():
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-        if args.n_train > 0:
-            raw_datasets["train"] = datasets.Dataset.from_dict(raw_datasets["train"][: args.n_train])
-        if args.n_val > 0:
-            raw_datasets["validation"] = datasets.Dataset.from_dict(raw_datasets["validation"][: args.n_val])
     else:
         data_files = {}
-        dataset_args = {}
         if args.train_file is not None:
             data_files["train"] = args.train_file
         if args.validation_file is not None:
             data_files["validation"] = args.validation_file
         extension = args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-            dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
-        raw_datasets = load_dataset(extension, data_files=data_files, **dataset_args)
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{args.validation_split_percentage}%]",
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{args.validation_split_percentage}%:]",
-                **dataset_args,
-            )
-    end_time = time()
-    accelerator.print(f"Dataset loaded in {(end_time - start_time)/60:.2f} minutes")
-
+        raw_datasets = load_dataset(extension, data_files=data_files)
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -386,15 +391,8 @@ def main():
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if args.config_overrides is not None:
-        logger.info(f"Overriding config: {args.config_overrides}")
-        config.update_from_string(args.config_overrides)
-        logger.info(f"New config: {config}")
-
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name, use_fast=not args.use_slow_tokenizer, use_auth_token=True
-        )
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
@@ -404,29 +402,76 @@ def main():
         )
 
     if args.model_name_or_path:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForSeq2SeqLM.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForSeq2SeqLM.from_config(config)
 
     model.resize_token_embeddings(len(tokenizer))
 
+    # Set decoder_start_token_id
+    if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
+        assert (
+            args.target_lang is not None and args.source_lang is not None
+        ), "mBart requires --target_lang and --source_lang"
+        if isinstance(tokenizer, MBartTokenizer):
+            model.config.decoder_start_token_id = tokenizer.lang_code_to_id[args.target_lang]
+        else:
+            model.config.decoder_start_token_id = tokenizer.convert_tokens_to_ids(args.target_lang)
+
+    if model.config.decoder_start_token_id is None:
+        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+
+    prefix = args.source_prefix if args.source_prefix is not None else ""
+
     # Preprocessing the datasets.
     # First we tokenize all the texts.
-    start_time = time()
     column_names = raw_datasets["train"].column_names
-    text_column_name = args.text_column_name if args.text_column_name in column_names else column_names[0]
 
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
+    # For translation we set the codes of our source and target languages (only useful for mBART, the others will
+    # ignore those attributes).
+    if isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
+        if args.source_lang is not None:
+            tokenizer.src_lang = args.source_lang
+        if args.target_lang is not None:
+            tokenizer.tgt_lang = args.target_lang
+
+    # Get the language codes for input/target.
+    source_lang = args.source_lang.split("_")[0]
+    target_lang = args.target_lang.split("_")[0]
+
+    padding = "max_length" if args.pad_to_max_length else False
+
+    # Temporarily set max_target_length for training.
+    max_target_length = args.max_target_length
+    padding = "max_length" if args.pad_to_max_length else False
+
+    def preprocess_function(examples):
+        inputs = [ex[source_lang] for ex in examples["translation"]]
+        targets = [ex[target_lang] for ex in examples["translation"]]
+        inputs = [prefix + inp for inp in inputs]
+        model_inputs = tokenizer(inputs, max_length=args.max_source_length, padding=padding, truncation=True)
+
+        # Tokenize targets with the `text_target` keyword argument
+        labels = tokenizer(text_target=targets, max_length=max_target_length, padding=padding, truncation=True)
+
+        # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
+        # padding in the loss.
+        if padding == "max_length" and args.ignore_pad_token_for_loss:
+            labels["input_ids"] = [
+                [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+            ]
+
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
 
     with accelerator.main_process_first():
-        tokenized_datasets = raw_datasets.map(
-            tokenize_function,
+        processed_datasets = raw_datasets.map(
+            preprocess_function,
             batched=True,
             num_proc=args.preprocessing_num_workers,
             remove_columns=column_names,
@@ -434,80 +479,38 @@ def main():
             desc="Running tokenizer on dataset",
         )
 
-    if args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > 1024:
-            logger.warning(
-                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                "Picking 1024 instead. You can change that default value by passing --block_size xxx."
-            )
-        block_size = 1024
-    else:
-        if args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(args.block_size, tokenizer.model_max_length)
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
-    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
-    # to preprocess.
-    #
-    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-
-    with accelerator.main_process_first():
-        lm_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {block_size}",
-        )
-
-    train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
-
-    end_time = time()
-    accelerator.print(f"Dataset tokenized/preprocessed in {(end_time - start_time)/60:.2f} minutes")
+    train_dataset = processed_datasets["train"]
+    eval_dataset = processed_datasets["validation"]
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # DataLoaders creation:
+    label_pad_token_id = -100 if args.ignore_pad_token_for_loss else tokenizer.pad_token_id
+    if args.pad_to_max_length:
+        # If padding was already done ot max length, we use the default data collator that will just convert everything
+        # to tensors.
+        data_collator = default_data_collator
+    else:
+        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
+        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
+        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer,
+            model=model,
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if accelerator.use_fp16 else None,
+        )
+
     train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=default_data_collator,
-        batch_size=args.per_device_train_batch_size,
-        drop_last=True,
+        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
-    eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size, drop_last=True
-    )
+    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "layer_norm.weight"]
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -518,7 +521,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -548,29 +551,34 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
-
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
         checkpointing_steps = int(checkpointing_steps)
 
     # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # We initialize the trackers only on main process because `accelerator.log`
+    # only logs on main process and we don't want empty logs/runs on other processes.
     if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("clm_no_trainer", experiment_config)
+        if accelerator.is_main_process:
+            experiment_config = vars(args)
+            # TensorBoard cannot log Enums, need the raw value
+            experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+            accelerator.init_trackers("translation_no_trainer", experiment_config)
+
+    metric = evaluate.load("sacrebleu")
+
+    def postprocess_text(preds, labels):
+        preds = [pred.strip() for pred in preds]
+        labels = [[label.strip()] for label in labels]
+
+        return preds, labels
 
     # Train!
     # New Code
@@ -582,6 +590,7 @@ def main():
         total_batch_size = (
             args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
         )
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -621,9 +630,7 @@ def main():
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
-    epoch_times = []
     for epoch in range(starting_epoch, args.num_train_epochs):
-        start_time = time()
         model.train()
         if args.with_tracking:
             total_loss = 0
@@ -635,20 +642,17 @@ def main():
                         progress_bar.update(1)
                         completed_steps += 1
                     continue
-
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                accelerator.backward(loss)
+            outputs = model(**batch)
+            loss = outputs.loss
+            # We keep track of the loss at each epoch
+            if args.with_tracking:
+                total_loss += loss.detach().float()
+            loss = loss / args.gradient_accumulation_steps
+            accelerator.backward(loss)
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
 
@@ -658,6 +662,7 @@ def main():
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+
             if completed_steps >= args.max_train_steps:
                 break
 
@@ -668,7 +673,6 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-
             # New Code
             # For Megatron-LM, the losses are already averaged across the data parallel group
             if accelerator.distributed_type == DistributedType.MEGATRON_LM:
@@ -685,7 +689,7 @@ def main():
         except OverflowError:
             perplexity = float("inf")
 
-        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+        logger.info(f"epoch {epoch}: perplexity: {perplexity}")
 
         if args.with_tracking:
             accelerator.log(
@@ -698,10 +702,6 @@ def main():
                 },
                 step=completed_steps,
             )
-
-        end_time = time()
-        epoch_times.append(end_time - start_time)
-        accelerator.print(f"epoch {epoch} training + evaluation took {epoch_times[-1]/60:2f} minutes")
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -721,12 +721,13 @@ def main():
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
 
-    total_training_time = sum(epoch_times)
-    accelerator.print(f"Total Training + Evaluation took {total_training_time/60:2f} minutes")
-    if accelerator.is_main_process:
+    if args.with_tracking:
+        accelerator.end_training()
+
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
 
 
 if __name__ == "__main__":
+
     main()
