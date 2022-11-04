@@ -615,6 +615,7 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     epoch_times = []
+    print_logits_flag = True
     for epoch in range(starting_epoch, args.num_train_epochs):
         start_time = time()
         model.train()
@@ -639,8 +640,9 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                accelerator.print(outputs.logits)
-                break
+                if print_logits_flag:
+                    print(f"{accelerator.process_index=} {outputs.logits=}")
+                    print_logits_flag = False
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -670,15 +672,6 @@ def main():
                 losses.append(loss)
             else:
                 losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-            tokenizer.pad_token = tokenizer.eos_token
-            batch_texts = ["Are you human? ", "The purpose of life is ", "It's nice ", "HuggingFace "]
-            batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
-            generated_tokens = model.generate(
-                batch_encodings["input_ids"], batch_encodings["attention_mask"], max_new_tokens=128
-            )
-            decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy(), skip_special_tokens=True)
-            accelerator.print(decoded_preds)
-            break
         try:
             if accelerator.distributed_type == DistributedType.MEGATRON_LM:
                 losses = torch.tensor(losses)
@@ -730,6 +723,60 @@ def main():
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
+
+    # inference using `generate` functionality
+    tokenizer.pad_token = tokenizer.eos_token
+    max_new_tokens = 64
+    batch_texts = [
+        "Are you human?",
+        "The purpose of life is",
+        "The arsenal was constructed at the request of",
+        "How are you doing these days?",
+    ]
+    batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
+
+    # top-p sampling
+    generated_tokens = model.generate(
+        batch_encodings["input_ids"],
+        batch_encodings["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        top_p=0.8,
+        top_p_decay=0.5,
+        temperature=0.9,
+    )
+    decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy())
+    accelerator.print(decoded_preds)
+
+    # top-k sampling
+    generated_tokens = model.generate(
+        batch_encodings["input_ids"],
+        batch_encodings["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        top_k=50,
+        temperature=0.9,
+    )
+    decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy())
+    accelerator.print(decoded_preds)
+
+    # adding `bos` token at the start
+    generated_tokens = model.generate(
+        batch_encodings["input_ids"], batch_encodings["attention_mask"], max_new_tokens=max_new_tokens, add_BOS=True
+    )
+    decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy())
+    accelerator.print(decoded_preds)
+
+    # beam search => only takes single prompt
+    batch_texts = ["The purpose of life is"]
+    batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
+    generated_tokens = model.generate(
+        batch_encodings["input_ids"],
+        batch_encodings["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        num_beams=20,
+        length_penalty=1.5,
+    )
+    decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy())
+    accelerator.print(decoded_preds)
 
 
 if __name__ == "__main__":
