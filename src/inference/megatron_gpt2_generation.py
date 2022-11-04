@@ -691,7 +691,12 @@ def main():
             else:
                 losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
-            generated_tokens = model.generate(batch["input_ids"], batch["attention_mask"], max_new_tokens=128)
+            tokenizer.pad_token = tokenizer.eos_token
+            batch_texts = ["Are you human? ", "The purpose of life is ", "It's nice ", "HuggingFace "]
+            batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
+            generated_tokens = model.generate(
+                batch_encodings["input_ids"], batch_encodings["attention_mask"], max_new_tokens=128
+            )
             decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy(), skip_special_tokens=True)
             accelerator.print(decoded_preds)
             break
