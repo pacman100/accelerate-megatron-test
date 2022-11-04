@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, MegatronLMDummyScheduler
+from accelerate.utils import set_seed, MegatronLMDummyScheduler, MegatronLMPlugin
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -266,7 +266,16 @@ def main():
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["logging_dir"] = args.output_dir
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    vocab_file = os.path.join(args.resume_from_checkpoint, "vocab.json")
+    merge_file = os.path.join(args.resume_from_checkpoint, "merges.txt")
+    other_megatron_args = {"vocab_file": vocab_file, "merge_file": merge_file}
+    megatron_lm_plugin = MegatronLMPlugin(return_logits=True, other_megatron_args=other_megatron_args)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        megatron_lm_plugin=megatron_lm_plugin,
+        **accelerator_log_kwargs,
+    )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
