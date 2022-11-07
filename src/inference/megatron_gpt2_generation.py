@@ -768,7 +768,7 @@ def main():
     # beam search => only takes single prompt
     batch_texts = ["The purpose of life is"]
     batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
-    generated_tokens = model.generate(
+    generated_tokens = model.megatron_generate(
         batch_encodings["input_ids"],
         batch_encodings["attention_mask"],
         max_new_tokens=max_new_tokens,
