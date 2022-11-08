@@ -724,7 +724,7 @@ def main():
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
 
-    # inference using `generate` functionality
+    # inference using `megatron_generate` functionality
     tokenizer.pad_token = tokenizer.eos_token
     max_new_tokens = 64
     batch_texts = [
@@ -736,7 +736,7 @@ def main():
     batch_encodings = tokenizer(batch_texts, return_tensors="pt", padding=True)
 
     # top-p sampling
-    generated_tokens = model.generate(
+    generated_tokens = model.megatron_generate(
         batch_encodings["input_ids"],
         batch_encodings["attention_mask"],
         max_new_tokens=max_new_tokens,
@@ -748,7 +748,7 @@ def main():
     accelerator.print(decoded_preds)
 
     # top-k sampling
-    generated_tokens = model.generate(
+    generated_tokens = model.megatron_generate(
         batch_encodings["input_ids"],
         batch_encodings["attention_mask"],
         max_new_tokens=max_new_tokens,
@@ -759,7 +759,7 @@ def main():
     accelerator.print(decoded_preds)
 
     # adding `bos` token at the start
-    generated_tokens = model.generate(
+    generated_tokens = model.megatron_generate(
         batch_encodings["input_ids"], batch_encodings["attention_mask"], max_new_tokens=max_new_tokens, add_BOS=True
     )
     decoded_preds = tokenizer.batch_decode(generated_tokens.cpu().numpy())
