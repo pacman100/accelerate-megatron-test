@@ -1,0 +1,73 @@
+The Megatron LM model weights are initialized at random in `accelerator.prepare`. Please use `accelerator.load_checkpoint` to load a pre-trained checkpoint matching the distributed setup.
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 102483968
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 1): 101437440
+ > number of parameters on (tensor, pipeline) model parallel rank (1, 0): 102483968
+ > number of parameters on (tensor, pipeline) model parallel rank (1, 1): 101437440
+Preparing optimizer
+> learning rate decay style: linear
+Preparing scheduler
+...
+
+11/04/2022 14:47:18 - INFO - __main__ - ***** Running training *****
+11/04/2022 14:47:18 - INFO - __main__ -   Num examples = 2318
+11/04/2022 14:47:18 - INFO - __main__ -   Num Epochs = 2
+11/04/2022 14:47:18 - INFO - __main__ -   Instantaneous batch size per device = 24
+11/04/2022 14:47:18 - INFO - __main__ -   Total train batch size (w. parallel, distributed & accumulation) = 48
+11/04/2022 14:47:18 - INFO - __main__ -   Gradient Accumulation steps = 1
+11/04/2022 14:47:18 - INFO - __main__ -   Total optimization steps = 96
+  0%|                                                                        | 0/96 [00:00<?, ?it/s]
+Resumed from checkpoint: /home/sourab/temp/megatron_lm_checkpoint
+11/04/2022 14:47:18 - INFO - accelerate.accelerator - Loading states from /home/sourab/temp/megatron_lm_checkpoint
+11/04/2022 14:47:18 - INFO - accelerate.accelerator - Loading Megatron-LM Model, Optimizer and Scheduler
+Resuming from /home/sourab/temp/megatron_lm_checkpoint
+ loading release checkpoint from /home/sourab/temp/megatron_lm_checkpoint
+  Warning, trying to load an old checkpoint: 'types.SimpleNamespace' object has no attribute 'position_embedding_type'
+ checkpoint version 3.0
+  successfully loaded checkpoint from /home/sourab/temp/megatron_lm_checkpoint at iteration 0
+11/04/2022 14:47:18 - INFO - accelerate.accelerator - Megatron-LM Model , Optimizer and Scheduler loaded from input dir /home/sourab/temp/megatron_lm_checkpoint
+11/04/2022 14:47:18 - INFO - accelerate.checkpointing - All model weights loaded successfully
+11/04/2022 14:47:18 - INFO - accelerate.checkpointing - All optimizer states loaded successfully
+11/04/2022 14:47:18 - INFO - accelerate.checkpointing - All scheduler states loaded successfully
+11/04/2022 14:47:18 - INFO - accelerate.checkpointing - Could not load random states
+11/04/2022 14:47:18 - INFO - accelerate.accelerator - Loading in 0 custom states
+  0%|                                                                        | 0/96 [00:00<?, ?it/s]
+accelerator.process_index=3 outputs.logits=tensor([[[ 4.4648,  3.7715, -3.1172,  ...,  1.4053,  1.4053,  1.4053],
+         [ 0.6279,  3.5449, -1.7275,  ...,  0.9048,  0.9048,  0.9048],
+         [ 3.1074,  5.1484, -2.4570,  ...,  3.0684,  3.0684,  3.0684],
+         ...,
+       device='cuda:3', grad_fn=<CatBackward0>)
+ 50%|███████████████████████████████▌                               | 48/96 [00:40<00:36,  1.33it/s]11/04/2022 14:48:00 - INFO - __main__ - epoch 0: perplexity: 14.762350004624928 eval_loss: 2.692080020904541
+epoch 0 training + evaluation took 0.708652 minutes
+100%|███████████████████████████████████████████████████████████████| 96/96 [01:19<00:00,  1.32it/s]11/04/2022 14:48:39 - INFO - __main__ - epoch 1: perplexity: 14.325097285606006 eval_loss: 2.662013053894043
+epoch 1 training + evaluation took 0.648274 minutes
+Total Training + Evaluation took 1.356926 minutes
+
+...
+Greedy generation on a batch of 4 below with adding `bos` token at the start
+['<|endoftext|>Are you human or are you... conventional?: What the heck is being called ` `... from television\'together? * Smiles * " "\' ( BBC ) ” [ 64 Bill Atkinson, Ep. 77 ], the stage play\'[ 61 G.A.U.S.L.D.\'], based on Jack Lee\'s Animal Volumes \'',
+
+ '<|endoftext|>The purpose of life is to make you think, not to glorify. I try to live as I want to live ; I live at broke bread and frugal with my excess. There are times when you might not like what you see painted on a work of art, but you have to accept it when you have the opportunity to see the full light of happiness.', 
+
+'<|endoftext|>The arsenal was constructed at the request of Germany in the mid @-@ 1930s, first in the Frankfurt @-@ Burgess Conservatory for the Erkenau Expedition and then in the Kattegat Protectorate, unused since Eastern Front. About twenty guns were taken from the Levant and transferred to the modern arsenal. The first Heinkel Bf 110 dive bombers were', 
+
+'<|endoftext|>How are you doing these days? Last night you were really really quiet for a while, no mean feat for a baby of your age. Has that dog been around for years? " How are you doing, Baby? That is a really interesting question, " says my daughter, matter of factly, actually giving me the space to actually reassure her that everything and everyone is']
+
+Beam generation on an individual input below
+['The purpose of life is to make the world a better place. " \n = = = Education = = = \n = = = = Education = = = = \n = = = = Education = = = = \n = = = = Education = = = = \n = = = = Education = = = = \n = = =']
+100%|███████████████████████████████████████████████████████████████| 96/96 [01:30<00:00,  1.06it/s]
+wandb: Waiting for W&B process to finish... (success).
+wandb:                                                                                
+wandb: 
+wandb: Run history:
+wandb:      epoch ▁█
+wandb:  eval_loss █▁
+wandb: perplexity █▁
+wandb:       step ▁█
+wandb: train_loss █▁
+wandb: 
+wandb: Run summary:
+wandb:      epoch 1
+wandb:  eval_loss 2.66201
+wandb: perplexity 14.3251
+wandb:       step 96
+wandb: train_loss 2.68363
